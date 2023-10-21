@@ -12,36 +12,67 @@ import time
 import network
 from mqtt import MQTTClient
 
-PIN_MOSI = 19
-PIN_MISO = 16
-PIN_SCK = 18
-PIN_CS = 17
-PIN_RESET = 20
-PWM_HEAT = 15
+PIN_MOSI = 19                  # Pin 25   used for the internal SPI to LAN
+PIN_MISO = 16                  # Pin 21   "
+PIN_SCK = 18                   # Pin 24   "
+PIN_CS = 17                    # Pin 22   "
+PIN_RESET = 20                 # Pin 26   "
+
+PWM_HEAT = 15                   # GP15 (Pin 20)  Channel 1 with PWM
+CHANNEL_2 = 14                  # GP14 (Pin 19)  Channel 2
+CHANNEL_3 = 13                  # GP13 (Pin 17)  Channel 3
 LED_BUITLTIN = 25               # For RP2040-HAT
 
+debug = False
 
 #mqtt config
-mqtt_server = '192.168.178.28'
+mqtt_server = '102.130.150.280'
 client_id = 'Heating_Rod'
 topic_heating_online = b'HeatingRod/online'
-topic_heating_power = b'HeatingRod/power'
+topic_heatingPower = b'HeatingRod/power'
 
 #defines for enable heating:
-min_power = -50
+min_power = 80
 min_solar = 200
 min_battery = 0
+reduced_batteryload = 650
+max_batteryload = 1800
 min_forcePower = 30
 
+power2pwmList = [
+    (960, 65500),
+    (950, 59800),
+    (900, 49900),    
+    (850, 46600),
+    (800, 44100),
+    (750, 42200),
+    (700, 40000),
+    (650, 38600),
+    (600, 37100),
+    (550, 35800),
+    (500, 34500),
+    (450, 33200),
+    (400, 32000),
+    (350, 30900),
+    (300, 29800),
+    (250, 28700),
+    (200, 27700),
+    (150, 26500),
+    (100, 25200),
+    (80, 24700),
+    (70, 0)
+    ]
 
 class subTopics:
-    topic = {'Smartmeter/1-0:16.7.0': ["power", '*'],
-             'sma/TIME': ["mytime",  None],
+    topic = {'Smartmeter/1-0:16.7.0': ["power", '*'],			# is negativ if supply the line
+             'sma/TIME': ["smaTime",  None],
              'sma/P_AC': ["solar", None],
              'Battery/power': ["battery", None],
-             'HeatingRod/forcePower': ["forcePower", None]
+             'Battery/bat_state': ["bat_state", None],
+             'HeatingRod/forcePower': ["forcePower", None],
+             'HeatingRod/forcePWM': ["forcePWM", None]            
              }
-    
+
     def __init__(self):
         for topic in self.topic:
             setattr(self, self.topic[topic][0], 0)
@@ -60,11 +91,6 @@ class subTopics:
             split = self.topic[topic][1]
             value = int(value) if split is None else int(value.split(split)[0])
             setattr(self, self.topic[topic][0], value)    
-
-
-pwm = PWM(Pin(PWM_HEAT, mode=Pin.OUT)) # Attach PWM object on the LED pin
-pwm.duty_u16 (0)
-led = Pin(LED_BUITLTIN, Pin.OUT)
 
 #W5x00 chip init
 def w5x00_init():
@@ -91,16 +117,25 @@ def reconnect():
     time.sleep(5)
     machine.reset()
     
-def power2pwm(power): 
-    pwm = float(power) /1000.0 * 65536.0
-    pwm = 65530 if pwm > 65500 else pwm
-    return int(pwm)
-
-# Settings
-#pwm_led.freq(1_000)     # = 1kHz
+def power2pwm(power):
+    for compare in power2pwmList:
+        if power >= compare[0]:
+            #print(f'        power2pwm: {power}, {compare}')
+            return compare
+    else:
+        #print(f'        power2pwm: 0, {compare[1]}')
+        return 0, compare[1]
 
 
 def main():
+    ch2 = Pin(CHANNEL_2, Pin.OUT)
+    ch3 = Pin(CHANNEL_3, Pin.OUT)
+    ch2.off()
+    ch3.off()
+    pwm = PWM(Pin(PWM_HEAT, mode=Pin.OUT)) # Attach PWM object on the LED pin
+    pwm.duty_u16(power2pwm(0)[1])
+    heatingPower = 0
+    led = Pin(LED_BUITLTIN, Pin.OUT)
     w5x00_init()
     subtopics = subTopics()
     try: 
@@ -111,40 +146,69 @@ def main():
     subtopics.set_client(client)
     
     received_time = 0
-    heating_power = 0
+    heatingPower = 0
     lasttime = 0
+    lastmqttTime = 0
+    lastpower = 0
+    lastcalculation = 0
 
     while True:
-        #for duty in range(0,100, 1):
-        #    pwm_led.duty_u16(32768)
-        #for duty in range(65_536,0, -10):
-        #    sleep(0.001)
-        #    pwm_led.duty_u16(duty)
-
-        time.sleep(.2)
-
-        subtopics.subscribe()
-        client.publish(topic_heating_online, "online")
-        client.publish(topic_heating_power, str(heating_power))
+        time.sleep(.5)
         
-        if received_time < subtopics.mytime:
+        if subtopics.power != lastpower:
             led.toggle()
-            received_time = subtopics.mytime
+            received_time = subtopics.smaTime
             lasttime = utime.time()
+            setPower = True
             if subtopics.forcePower > min_forcePower:
-                heating_power = subtopics.forcePower                
-            elif subtopics.power < min_power and subtopics.solar > min_solar and subtopics.battery < min_battery:
-                heating_power = heating_power - subtopics.power + min_power
+                heatingPower = subtopics.forcePower
+            elif subtopics.forcePWM > 0:
+                print(f'     forcePWM = {subtopics.forcePWM}')
+                pwmvalue = subtopics.forcePWM
+                heatingPower = -1
+                setPower = False
+            elif subtopics.solar > min_solar:
+                batteryOffset = 0
+                if (subtopics.bat_state == 0):
+                    batteryOffset = 0
+                elif (subtopics.bat_state == 1):
+                    # battery is full or loading is disabled
+                    batteryOffset = subtopics.battery
+                elif subtopics.bat_state == 2:
+                    # battery is loading with reduced power
+                    batterOffset = reduced_batteryload
+                elif  subtopics.bat_state == 3:
+                    # battery is loading with max power
+                    batteryOffset =  max_batteryload
+                if lastcalculation == 0 or lasttime - lastcalculation > 4:
+                    oldvalue = heatingPower
+                    heatingPower = heatingPower - subtopics.power - min_power -batteryOffset
+                    lastcalculation = lasttime
+                    if debug:
+                        print(f'     calculated new heatingPower = {heatingPower} = {oldvalue} - {subtopics.power} - {min_power} - {batteryOffset}, bat_status = {subtopics.bat_state}')
             else:
-                heating_power = 0
-            pwmvalue = power2pwm(heating_power)
+                if debug:
+                    print(f'    bedingungen nicht erfuellt -> set heading = 0, solar={subtopics.solar}, power= {subtopics.power}')
+                heatingPower = 0
+            if setPower:
+                heatingPower, pwmvalue = power2pwm(heatingPower)
             pwm.duty_u16(pwmvalue)
-            print(f'power = {subtopics.power}, solar = {subtopics.solar}, battery = {subtopics.battery}')
-            print(f'pwmvalue = {pwmvalue}, forcePower = {subtopics.forcePower}, heating = {heating_power}')
-        elif (lasttime + 8) < utime.time():
-            # zeit abfragen, wenn länger als 5s keine time gesetzt wird, dann heating_power = 0
-            heating_power = 0
-            pwm.duty_u16(heating_power)
+            
+        elif received_time < subtopics.smaTime:
+            received_time = subtopics.smaTime
+            lasttime = utime.time()
+
+        if (lastmqttTime + 1) <= utime.time():
+            lastmqttTime = utime.time()
+            subtopics.subscribe()
+            client.publish(topic_heating_online, "online")
+            client.publish(topic_heatingPower, str(heatingPower))
+            if debug:
+                print(f'power = {subtopics.power}, solar = {subtopics.solar}, battery = {subtopics.battery}, received_time = {received_time}   --> heating = {heatingPower}')
+        if (lasttime + 6) < utime.time():   # something is wrong, more than 6s no change from received time -switch off
+            lasttime = utime.time()
+            heatingPower, pwmvalue = power2pwm(0)
+            pwm.duty_u16(pwmvalue)
             print(f' lastime={lasttime}, utime = {utime.time()}')
             print(f'no update from time  -> set heating = 0')
         
