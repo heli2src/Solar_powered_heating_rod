@@ -1,4 +1,6 @@
 '''
+Released under the MIT License (MIT). See LICENSE.
+
 heating rod controlled by w5100s-evb-pico
 
  
